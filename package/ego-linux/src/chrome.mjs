@@ -1,16 +1,22 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { access, mkdir, open, readFile, writeFile, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
-import { BROWSER_STATE_FILE, PROFILE_DIR } from "./paths.mjs";
+import {
+  BROWSER_STATE_FILE,
+  LAUNCH_LOG_FILE,
+  PROFILE_DIR,
+  STATE_DIR,
+} from "./paths.mjs";
 import { acquireDirectoryLock } from "./launch-lock.mjs";
 import { writePrivateStateFile } from "./private-state.mjs";
 import {
   browserDisplayFlags,
   clearSingletonArtifacts,
   detachedSpawnOptions,
+  headedDisplayBlocker,
   listProcesses,
   processArgv,
   processIsAlive,
@@ -552,6 +558,8 @@ export async function prepareProfileForLaunch(profileDir = PROFILE_DIR) {
 }
 
 async function launch({ headless }) {
+  const blocker = headedDisplayBlocker({ headless });
+  if (blocker) throw new Error(blocker);
   const binary = await resolveBrowserBinary();
   const debugPort = await allocateDebugPort();
   await mkdir(PROFILE_DIR, { recursive: true });
@@ -569,16 +577,31 @@ async function launch({ headless }) {
     "--remote-debugging-address=127.0.0.1",
     ...browserStartupFlags({ headless }),
   ];
+  // Chrome's stderr is the only account of why a launch that never reached the
+  // endpoint failed — a missing display, a crash and a damaged profile all look
+  // identical from the outside. A detached child outlives this process, so it
+  // writes to a file instead of a pipe nobody is left to drain.
+  await mkdir(STATE_DIR, { recursive: true });
+  const launchLog = await open(LAUNCH_LOG_FILE, "w").catch(() => null);
   const child = spawn(
     binary,
     args,
-    detachedSpawnOptions({ env: browserLaunchEnvironment() }),
+    detachedSpawnOptions({
+      env: browserLaunchEnvironment(),
+      ...(launchLog ? { stdio: ["ignore", "ignore", launchLog.fd] } : {}),
+    }),
   );
   child.unref();
+  await launchLog?.close();
 
-  const { port, wsUrl } = await waitForEndpoint(PROFILE_DIR, {
-    port: debugPort,
-  });
+  let endpoint;
+  try {
+    endpoint = await waitForEndpoint(PROFILE_DIR, { port: debugPort });
+  } catch (error) {
+    const hint = await launchLogHint();
+    throw new Error(hint ? `${error.message}\n${hint}` : error.message);
+  }
+  const { port, wsUrl } = endpoint;
   await writeBrowserState({
     port,
     wsUrl,
@@ -588,6 +611,30 @@ async function launch({ headless }) {
     profileDir: PROFILE_DIR,
   });
   return { port, wsUrl, pid: child.pid, launched: true };
+}
+
+/**
+ * What Chrome said while failing, if it said anything.
+ *
+ * Only the tail is kept: the interesting lines are last, and a launch log can
+ * carry a few hundred lines of GPU and extension noise before them.
+ */
+async function launchLogHint() {
+  let output = "";
+  try {
+    output = await readFile(LAUNCH_LOG_FILE, "utf8");
+  } catch {
+    return "";
+  }
+  const lines = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return "";
+  return [
+    `Chrome's own output (${LAUNCH_LOG_FILE}):`,
+    ...lines.slice(-12).map((line) => `  ${line}`),
+  ].join("\n");
 }
 
 /**
@@ -711,6 +758,13 @@ export async function stopBrowser() {
 
   if (!pid) {
     await rm(BROWSER_STATE_FILE, { force: true });
+    // Nothing owns the profile, but the launch that died may have left the
+    // guard behind — clearing it is the whole point of --stop, and the CLI
+    // already claims it did. A lock left by an owner we do not recognize is
+    // live, and is not ours to remove.
+    if (lockOwner === null || !processIsAlive(lockOwner)) {
+      await clearSingletonArtifacts(PROFILE_DIR);
+    }
     return false;
   }
   let stopped = false;

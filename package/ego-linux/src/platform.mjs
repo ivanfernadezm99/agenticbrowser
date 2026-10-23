@@ -51,6 +51,32 @@ export function browserDisplayFlags({
   return [];
 }
 
+/**
+ * Why a visible launch cannot work, or null when it can.
+ *
+ * A process with no session to draw on — an agent shell started outside the
+ * graphical login is the ordinary case — gets no DevTools endpoint at all:
+ * Chrome dies with `Missing X server or $DISPLAY` and the launch waits out its
+ * full timeout. Asking first turns a silent 20 second stall into one sentence.
+ */
+export function headedDisplayBlocker({
+  headless = false,
+  env = process.env,
+  platform = process.platform,
+} = {}) {
+  if (headless || platform !== "linux") return null;
+  // An explicit Wayland request is the caller saying where the compositor is.
+  if ((env.EGO_LINUX_WINDOW_BACKEND || "").toLowerCase() === "wayland") {
+    return null;
+  }
+  if (env.DISPLAY || env.WAYLAND_DISPLAY) return null;
+  return (
+    "DISPLAY and WAYLAND_DISPLAY are both unset, so a visible browser cannot " +
+    'start — Chrome exits with "Missing X server or $DISPLAY". Re-run with ' +
+    "DISPLAY=:0, or set EGO_LINUX_HEADLESS=1 (or pass --headless)."
+  );
+}
+
 function runCapturedCommand(command, args, { timeoutMs = 2000 } = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, {

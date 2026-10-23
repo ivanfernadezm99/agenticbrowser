@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,4 +58,35 @@ test("stopBrowser ignores stale state pointing at an unrelated pid and port", as
     await new Promise((resolve) => server.close(resolve));
     await rm(SANDBOX, { recursive: true, force: true });
   }
+});
+
+test("stopBrowser leaves no profile guard behind a launch that died", async () => {
+  const profile = process.env.EGO_LINUX_PROFILE;
+  await mkdir(profile, { recursive: true });
+  // A launch that died between writing its guard and opening DevTools leaves
+  // exactly these, still naming a pid the kernel has already forgotten.
+  const departed = spawn(process.execPath, ["-e", "process.exit(0)"], {
+    stdio: "ignore",
+  });
+  await new Promise((resolve) => departed.once("exit", resolve));
+
+  const artifacts = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+  for (const name of artifacts) {
+    await symlink(`test-host-${departed.pid}`, join(profile, name));
+  }
+  await rm(BROWSER_STATE_FILE, { force: true });
+
+  assert.equal(await stopBrowser(), false, "nothing was running");
+
+  for (const name of artifacts) {
+    // lstat, not access: these are symlinks to a pid, and a dangling link is
+    // exactly what a stale guard looks like.
+    await assert.rejects(
+      lstat(join(profile, name)),
+      { code: "ENOENT" },
+      `${name} survived --stop, and the CLI had already claimed it cleared it`,
+    );
+  }
+
+  await rm(SANDBOX, { recursive: true, force: true });
 });
